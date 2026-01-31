@@ -13,37 +13,39 @@ A simple macOS menu bar app to **one-click rotate** your external display betwee
 
 ## Installation
 
-### Quick Install (Recommended)
+### 📦 Download Pre-built App (Easiest)
 
-1. Download/clone this folder
-2. Open Terminal and navigate to this folder
-3. Run:
+1. **[Download ScreenRotator v1.1.1](https://github.com/vecyang1/macos-display-rotator/releases/latest)** (24MB)
+2. Unzip and move **ScreenRotator.app** to your `/Applications` folder
+3. Install `displayplacer`:
    ```bash
-   ./run.sh
+   brew install jakehilborn/jakehilborn/displayplacer
+   ```
+4. Open **ScreenRotator.app**
+5. Grant **Accessibility permissions** when prompted:
+   - System Settings → Privacy & Security → Accessibility → Enable for ScreenRotator
+
+### 🛠️ Build from Source (Advanced)
+
+1. Clone this repo:
+   ```bash
+   git clone https://github.com/vecyang1/macos-display-rotator.git
+   cd macos-display-rotator
    ```
 
-### Manual Install
-
-1. Install Homebrew if you don't have it:
+2. Install dependencies:
    ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   brew install jakehilborn/jakehilborn/displayplacer
+   pip3 install rumps pynput py2app
    ```
 
-2. Install displayplacer:
+3. Build the app:
    ```bash
-   brew tap jakehilborn/jakehilborn
-   brew install displayplacer
+   python3 setup.py py2app
    ```
 
-3. Install Python dependencies:
-   ```bash
-   pip3 install rumps pynput
-   ```
+4. Find your app in `dist/ScreenRotator.app`
 
-4. Run the app:
-   ```bash
-   python3 screen_rotator.py
-   ```
 
 ## Usage
 
