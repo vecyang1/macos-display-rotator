@@ -140,8 +140,7 @@ class ScreenRotatorApp(rumps.App):
         launch_item = rumps.MenuItem("Launch at Login", callback=self.toggle_launch_at_login)
         launch_item.state = self.is_launch_at_login_enabled()
         self.menu.add(launch_item)
-        
-        self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
+
 
     def select_target(self, sender, persistent_id):
         """Handle target display selection from menu"""
