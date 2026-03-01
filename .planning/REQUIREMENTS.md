@@ -137,7 +137,16 @@
 
 | Requirement | Phase | Plan | Status |
 |-------------|-------|------|--------|
-| (To be populated during roadmap creation) | | | |
+| REQ-DC-001 | Phase 2 | TBD | Pending |
+| REQ-DC-002 | Phase 2 | TBD | Pending |
+| REQ-DC-003 | Phase 3 | TBD | Pending |
+| REQ-DC-004 | Phase 4 | TBD | Pending |
+| REQ-UI-001 | Phase 6 | TBD | Pending |
+| REQ-UI-002 | Phase 6 | TBD | Pending |
+| REQ-UI-003 | Phase 6 | TBD | Pending |
+| REQ-REL-001 | Phase 5 | TBD | Pending |
+| REQ-REL-002 | Phase 5 | TBD | Pending |
+| REQ-REL-003 | Phase 2 | TBD | Pending |
 
 ---
-*Last updated: 2026-03-01 during new-project workflow*
+*Last updated: 2026-03-01 during roadmap creation*
