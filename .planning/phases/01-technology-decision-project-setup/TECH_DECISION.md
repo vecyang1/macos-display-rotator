@@ -214,4 +214,26 @@ None of these conditions currently apply.
 
 ---
 
+## Final Decision (Plan 02)
+
+**Decision**: Enhance existing Python implementation by adding origin parameter to displayplacer command.
+
+**Primary Rationale**: The arrangement preservation bug is caused by a missing parameter (origin coordinates) in the rotation command at line 467 of screen_rotator.py. This is a simple, localized fix requiring modification of 2 methods (get_display_info and set_rotation) with an estimated effort of 2.5 hours. A Swift rebuild would take 40 hours and discard 750 lines of working code without providing additional benefit for the core use case.
+
+**Trade-offs Accepted**:
+- **CLI Dependency**: Continues reliance on displayplacer (external tool). Mitigation: displayplacer is actively maintained, widely used, and has proven reliable.
+- **Not Native**: Uses subprocess calls rather than direct CoreGraphics API. Mitigation: Performance overhead is negligible for user-initiated rotation actions.
+- **Future Maintenance**: If displayplacer becomes unmaintained, will need to reconsider Swift rebuild. Mitigation: displayplacer has active community and Homebrew support.
+
+**Risk Mitigation**:
+1. **Coordinate transformation complexity**: Use absolute origin coordinates from current layout - no transformation needed when rotating
+2. **displayplacer reliability**: Already using displayplacer successfully for rotation; origin is just an additional parameter
+3. **Edge cases**: Existing error handling and retry logic sufficient; will test with display unplugging scenarios
+4. **Backward compatibility**: origin parameter is optional in displayplacer, so change is non-breaking
+
+**Decision Enables Phase 2+ Planning**: With Python enhancement confirmed, Phase 2 can proceed with core engine improvements (origin parameter fix, error handling, retry logic) without architectural changes.
+
+---
+
 *Analysis completed: 2026-03-01*
+*Final decision documented: 2026-03-01*
