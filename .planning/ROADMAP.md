@@ -8,11 +8,11 @@
 ## Phases
 
 - [x] **Phase 1: Technology Decision & Project Setup** - Evaluate Python enhancement vs Swift rebuild and establish development foundation
-- [ ] **Phase 2: Core Rotation Engine** - Ensure reliable display detection and rotation execution
-- [ ] **Phase 3: Arrangement Preservation** - Fix display position preservation after rotation (primary value)
-- [ ] **Phase 4: Display Profiles** - Save and restore configurations per orientation
-- [ ] **Phase 5: Error Handling & Reliability** - Implement retry logic, verification, and edge case handling
-- [ ] **Phase 6: UI Polish & Integration** - Refine menu bar, hotkey, and display selection features
+- [x] **Phase 2: Core Rotation Engine** - Ensure reliable display detection and rotation execution
+- [x] **Phase 3: Arrangement Preservation** - Fix display position preservation after rotation (primary value)
+- [x] **Phase 4: Display Profiles** - Save and restore configurations per orientation
+- [x] **Phase 5: Error Handling & Reliability** - Implement retry logic, verification, and edge case handling
+- [x] **Phase 6: UI Polish & Integration** - Refine menu bar, hotkey, and display selection features
 
 ## Phase Details
 
@@ -129,11 +129,11 @@
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Technology Decision & Project Setup | 2/2 | ✅ Complete | 2026-03-01 |
-| 2. Core Rotation Engine | 0/0 | Not started | - |
-| 3. Arrangement Preservation | 0/0 | Not started | - |
-| 4. Display Profiles | 0/0 | Not started | - |
-| 5. Error Handling & Reliability | 0/0 | Not started | - |
-| 6. UI Polish & Integration | 0/0 | Not started | - |
+| 2. Core Rotation Engine | 1/1 | ✅ Complete | 2026-03-08 |
+| 3. Arrangement Preservation | 1/1 | ✅ Complete | 2026-03-08 |
+| 4. Display Profiles | 1/1 | ✅ Complete | 2026-03-08 |
+| 5. Error Handling & Reliability | 1/1 | ✅ Complete | 2026-03-08 |
+| 6. UI Polish & Integration | 1/1 | ✅ Complete | 2026-03-08 |
 
 ---
 *Last updated: 2026-03-01*
