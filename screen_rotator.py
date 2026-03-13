@@ -66,6 +66,133 @@ class DisplayObserver(Foundation.NSObject):
         self.app.queue_update_menu()
 
 
+class SettingsWindow(Foundation.NSObject):
+    """Native macOS Settings Panel for Shortcut Management."""
+    
+    def initWithApp_(self, app):
+        self = objc.super(SettingsWindow, self).init()
+        if self:
+            self.app = app
+            self.window = None
+            self.labels = {}
+        return self
+
+    @objc.python_method
+    def show(self):
+        if self.window and self.window.isVisible():
+            self.window.makeKeyAndOrderFront_(None)
+            AppKit.NSApp.activateIgnoringOtherApps_(True)
+            return
+
+        # Define window dimensions and style
+        width, height = 450, 320
+        mask = (AppKit.NSTitledWindowMask | 
+                AppKit.NSClosableWindowMask | 
+                AppKit.NSMiniaturizableWindowMask)
+        
+        self.window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            Foundation.NSMakeRect(0, 0, width, height),
+            mask,
+            AppKit.NSBackingStoreBuffered,
+            False
+        )
+        self.window.setTitle_("Screen Rotator Settings")
+        self.window.center()
+        
+        # Main View
+        content_view = AppKit.NSView.alloc().initWithFrame_(Foundation.NSMakeRect(0, 0, width, height))
+        self.window.setContentView_(content_view)
+
+        # Title Label
+        title = self.create_label("Shortcut Settings", 18, (20, height - 45, width - 40, 30), bold=True)
+        content_view.addSubview_(title)
+
+        # Shortcut Rows
+        actions = [
+            ("toggle", "Toggle Orientation"),
+            ("rotate_0", "Standard (0°)"),
+            ("rotate_90", "Vertical (90°)"),
+            ("rotate_270", "Vertical (270°)")
+        ]
+
+        y_pos = height - 90
+        for action_id, display_name in actions:
+            # Action Label
+            lbl = self.create_label(display_name, 13, (30, y_pos, 150, 25))
+            content_view.addSubview_(lbl)
+
+            # Shortcut Display
+            shortcut_str = self.app.get_shortcut_display(action_id)
+            status_lbl = self.create_label(shortcut_str, 13, (180, y_pos, 120, 25), color=AppKit.NSColor.secondaryLabelColor())
+            self.labels[action_id] = status_lbl
+            content_view.addSubview_(status_lbl)
+
+            # Record Button
+            btn = AppKit.NSButton.alloc().initWithFrame_(Foundation.NSMakeRect(310, y_pos - 2, 60, 25))
+            btn.setTitle_("Set")
+            btn.setBezelStyle_(AppKit.NSRoundedBezelStyle)
+            btn.setTarget_(self)
+            btn.setAction_(objc.selector(self.recordClicked_, signature=b"v@:@"))
+            btn.setIdentifier_(action_id)
+            content_view.addSubview_(btn)
+
+            # Clear Button
+            clr_btn = AppKit.NSButton.alloc().initWithFrame_(Foundation.NSMakeRect(375, y_pos - 2, 50, 25))
+            clr_btn.setTitle_("✕")
+            clr_btn.setBezelStyle_(AppKit.NSRoundedBezelStyle)
+            clr_btn.setTarget_(self)
+            clr_btn.setAction_(objc.selector(self.clearClicked_, signature=b"v@:@"))
+            clr_btn.setIdentifier_(action_id)
+            content_view.addSubview_(clr_btn)
+
+            y_pos -= 40
+
+        # Separator
+        line = AppKit.NSBox.alloc().initWithFrame_(Foundation.NSMakeRect(20, 65, width - 40, 1))
+        line.setBoxType_(AppKit.NSBoxSeparator)
+        content_view.addSubview_(line)
+
+        # Footer Note
+        footer = self.create_label("Shortcuts are saved automatically.", 11, (20, 35, width - 40, 20), color=AppKit.NSColor.tertiaryLabelColor())
+        content_view.addSubview_(footer)
+
+        self.window.makeKeyAndOrderFront_(None)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+
+    def create_label(self, text, size, rect, bold=False, color=None):
+        label = AppKit.NSTextField.alloc().initWithFrame_(Foundation.NSMakeRect(*rect))
+        label.setStringValue_(text)
+        label.setFont_(AppKit.NSFont.boldSystemFontOfSize_(size) if bold else AppKit.NSFont.systemFontOfSize_(size))
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        if color:
+            label.setTextColor_(color)
+        return label
+
+    def recordClicked_(self, sender):
+        action_id = sender.identifier()
+        self.labels[action_id].setStringValue_("Recording...")
+        self.labels[action_id].setTextColor_(AppKit.NSColor.systemRedColor())
+        # Use existing recording logic
+        self.app.start_recording(action_id, callback=lambda: self.update_display(action_id))
+
+    def clearClicked_(self, sender):
+        action_id = sender.identifier()
+        self.app.shortcuts[action_id] = None
+        self.app.save_config()
+        self.app.start_hotkey_listener()
+        self.app.queue_update_menu()
+        self.update_display(action_id)
+
+    @objc.python_method
+    def update_display(self, action_id):
+        shortcut_str = self.app.get_shortcut_display(action_id)
+        self.labels[action_id].setStringValue_(shortcut_str)
+        self.labels[action_id].setTextColor_(AppKit.NSColor.secondaryLabelColor())
+
+
 def action_to_rotation(action: str) -> Optional[int]:
     return ACTION_ROTATIONS.get(action)
 
@@ -222,11 +349,13 @@ class ScreenRotatorApp(rumps.App):
         self.recorded_non_modifier = False
         self.recording_listener: Optional[keyboard.Listener] = None
         self.hotkey_listener: Optional[keyboard.Listener] = None
+        self.recording_done_callback = None
 
         self.load_config()
         if not self.target_display_persistent_id:
             self.auto_select_target()
 
+        self.settings_window = SettingsWindow.alloc().initWithApp_(self)
         self.setup_display_observer()
         self.update_menu()
         self.start_hotkey_listener()
@@ -315,10 +444,6 @@ class ScreenRotatorApp(rumps.App):
             self.target_display_persistent_id = displays[0]["persistent_id"]
 
     def update_menu(self) -> None:
-        # Don't refresh menu while recording a shortcut to avoid UI confusion
-        if self.recording_action:
-            return
-
         self.menu.clear()
 
         self.menu.add(
@@ -373,25 +498,10 @@ class ScreenRotatorApp(rumps.App):
 
         self.menu.add(displays_menu)
         self.menu.add(rumps.MenuItem("Refresh Displays", callback=self.refresh_displays))
-
-        shortcuts_menu = rumps.MenuItem("Set Shortcuts")
-        shortcuts_menu.add(
-            rumps.MenuItem("Record Toggle...", callback=lambda _: self.start_recording("toggle"))
-        )
-        shortcuts_menu.add(
-            rumps.MenuItem("Record 0°...", callback=lambda _: self.start_recording("rotate_0"))
-        )
-        shortcuts_menu.add(
-            rumps.MenuItem("Record 90°...", callback=lambda _: self.start_recording("rotate_90"))
-        )
-        shortcuts_menu.add(
-            rumps.MenuItem("Record 270°...", callback=lambda _: self.start_recording("rotate_270"))
-        )
-        shortcuts_menu.add(rumps.separator)
-        shortcuts_menu.add(rumps.MenuItem("Clear All", callback=self.clear_all_shortcuts))
-        self.menu.add(shortcuts_menu)
         self.menu.add(rumps.separator)
 
+        self.menu.add(rumps.MenuItem("Settings...", callback=lambda _: self.settings_window.show()))
+        
         launch_item = rumps.MenuItem("Launch at Login", callback=self.toggle_launch_at_login)
         launch_item.state = self.is_launch_at_login_enabled()
         self.menu.add(launch_item)
@@ -640,7 +750,7 @@ class ScreenRotatorApp(rumps.App):
             logging.error(f"Error normalizing key: {e}")
         return None
 
-    def start_recording(self, action: str) -> None:
+    def start_recording(self, action: str, callback=None) -> None:
         if not self.recording_lock.acquire(blocking=False):
             logging.info("Recording already in progress.")
             return
@@ -649,6 +759,7 @@ class ScreenRotatorApp(rumps.App):
             self.recording_action = action
             self.recorded_keys = []
             self.recorded_non_modifier = False
+            self.recording_done_callback = callback
 
             if self.recording_listener:
                 try:
@@ -668,6 +779,9 @@ class ScreenRotatorApp(rumps.App):
                         self.recording_action = None
                         self.notify("Shortcut", "Recording cancelled", "")
                         self.queue_update_menu()
+                        if self.recording_done_callback:
+                            rumps.notification("Shortcut", "Recording cancelled", "")
+                            self.recording_done_callback()
                         return False
                     
                     if key_name and key_name not in self.recorded_keys:
@@ -724,13 +838,16 @@ class ScreenRotatorApp(rumps.App):
             action = self.recording_action
             display = format_shortcut_display(ordered_keys)
             
-            with threading.Lock(): # Local atomic update
-                self.shortcuts[action] = {"keys": ordered_keys, "display": display}
+            self.shortcuts[action] = {"keys": ordered_keys, "display": display}
             
             self.recording_action = None
             self.save_config()
             self.queue_update_menu()
             self.start_hotkey_listener()
+            
+            if self.recording_done_callback:
+                self.recording_done_callback()
+            
             self.notify("Shortcut Saved", action.replace("_", " ").title(), display)
             logging.info(f"Shortcut saved for {action}: {display}")
         except Exception as e:
