@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import plistlib
 import re
@@ -10,9 +11,12 @@ import queue
 import threading
 from typing import Dict, List, Optional, Sequence, Union
 
+import AppKit
 import rumps
 from pynput import keyboard
 from pynput.keyboard import Key, KeyCode
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 ACTION_ROTATIONS = {
     "toggle": None,
@@ -136,7 +140,7 @@ class ScreenRotatorApp(rumps.App):
     CONFIG_FILE = os.path.expanduser("~/.screen_rotator_config.json")
     LAUNCH_AGENT_LABEL = "com.screenrotator.app"
 
-    @rumps.timer(0.1)
+    @rumps.timer(0.2)
     def process_ui_queue(self, _):
         try:
             while True:
@@ -162,6 +166,9 @@ class ScreenRotatorApp(rumps.App):
     def __init__(self):
         super().__init__(STATUS_ITEM_TITLE, icon=None)
         self.ui_queue = queue.Queue()
+        self.action_lock = threading.Lock()
+        self.recording_lock = threading.Lock()
+        
         self.target_display_persistent_id: Optional[str] = None
         self.displayplacer_path = self.find_displayplacer()
 
@@ -190,8 +197,23 @@ class ScreenRotatorApp(rumps.App):
         if not self.target_display_persistent_id:
             self.auto_select_target()
 
+        self.setup_display_observer()
         self.update_menu()
         self.start_hotkey_listener()
+
+    def setup_display_observer(self):
+        """Listen to native macOS display changes to sync state."""
+        nc = AppKit.NSNotificationCenter.defaultCenter()
+        nc.addObserver_selector_name_object_(
+            self,
+            "displayParametersChanged:",
+            AppKit.NSApplicationDidChangeScreenParametersNotification,
+            None
+        )
+        
+    def displayParametersChanged_(self, notification):
+        logging.info("System display parameters changed, updating UI state.")
+        self.queue_update_menu()
 
     def find_displayplacer(self) -> Optional[str]:
         displayplacer_path = shutil.which("displayplacer")
@@ -212,7 +234,7 @@ class ScreenRotatorApp(rumps.App):
                 if isinstance(config, dict):
                     return config
         except Exception as error:
-            print(f"Error reading config: {error}")
+            logging.error(f"Error reading config: {error}")
         return {}
 
     def write_config(self, config: Dict[str, object]) -> None:
@@ -220,7 +242,7 @@ class ScreenRotatorApp(rumps.App):
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as config_file:
                 json.dump(config, config_file, indent=2)
         except Exception as error:
-            print(f"Error writing config: {error}")
+            logging.error(f"Error writing config: {error}")
 
     def load_config(self) -> None:
         config = self.read_config()
@@ -263,29 +285,30 @@ class ScreenRotatorApp(rumps.App):
     def update_menu(self) -> None:
         self.menu.clear()
 
+        # Added threading for menu actions to prevent blocking the main UI thread during rotation
         self.menu.add(
             rumps.MenuItem(
                 f"Toggle Screen  [{self.get_shortcut_display('toggle')}]",
-                callback=self.toggle,
+                callback=lambda _: threading.Thread(target=self.toggle, args=(None,), daemon=True).start(),
             )
         )
         self.menu.add(rumps.separator)
         self.menu.add(
             rumps.MenuItem(
                 f"Rotate Standard (0°)  [{self.get_shortcut_display('rotate_0')}]",
-                callback=lambda _: self.set_rotation(0),
+                callback=lambda _: threading.Thread(target=self.set_rotation, args=(0,), daemon=True).start(),
             )
         )
         self.menu.add(
             rumps.MenuItem(
                 f"Rotate Vertical (90°)  [{self.get_shortcut_display('rotate_90')}]",
-                callback=lambda _: self.set_rotation(90),
+                callback=lambda _: threading.Thread(target=self.set_rotation, args=(90,), daemon=True).start(),
             )
         )
         self.menu.add(
             rumps.MenuItem(
                 f"Rotate Vertical (270°)  [{self.get_shortcut_display('rotate_270')}]",
-                callback=lambda _: self.set_rotation(270),
+                callback=lambda _: threading.Thread(target=self.set_rotation, args=(270,), daemon=True).start(),
             )
         )
         self.menu.add(rumps.separator)
@@ -303,7 +326,10 @@ class ScreenRotatorApp(rumps.App):
         else:
             for display in available_displays:
                 display_type = "External" if display["is_external"] else "Built-in"
-                display_name = f"{display['name']} ({display_type})"
+                # If there's an actual rotation, show it in the menu
+                current_degree = display.get("degree", "?")
+                display_name = f"{display['name']} ({display_type}) [{current_degree}°]"
+                
                 item = rumps.MenuItem(
                     display_name,
                     callback=lambda sender, pid=display["persistent_id"]: self.select_target(sender, pid),
@@ -372,12 +398,18 @@ class ScreenRotatorApp(rumps.App):
             if type_match:
                 name = type_match.group(1).split("\n")[0].strip()
 
+            degree = "?"
+            rotation_match = re.search(r"Rotation:\s*(\d+)", screen)
+            if rotation_match:
+                degree = rotation_match.group(1)
+
             results.append(
                 {
                     "persistent_id": persistent_id,
                     "name": name,
                     "is_external": is_external,
                     "is_built_in": is_built_in,
+                    "degree": degree,
                 }
             )
 
@@ -429,7 +461,7 @@ class ScreenRotatorApp(rumps.App):
             return None
         return parse_saved_layout_command(layouts.get(mode_key))
 
-    def wait_for_rotation(self, target_degree: int, timeout_seconds: float = 2.0) -> bool:
+    def wait_for_rotation(self, target_degree: int, timeout_seconds: float = 3.0) -> bool:
         if not self.target_display_persistent_id:
             return False
         attempts = max(1, int(timeout_seconds / 0.2))
@@ -442,81 +474,92 @@ class ScreenRotatorApp(rumps.App):
         return False
 
     def set_rotation(self, target_degree: int) -> None:
-        if target_degree not in (0, 90, 270):
-            self.notify("Invalid Rotation", str(target_degree), "")
+        if not self.action_lock.acquire(blocking=False):
+            logging.info("Rotation action already in progress, ignoring duplicate request.")
             return
 
-        if not self.target_display_persistent_id:
-            self.auto_select_target()
+        try:
+            if target_degree not in (0, 90, 270):
+                self.notify("Invalid Rotation", str(target_degree), "")
+                return
+
             if not self.target_display_persistent_id:
-                self.notify("Error", "No external display found", "")
-                return
-            self.queue_update_menu()
-
-        display_info = self.get_display_info(self.target_display_persistent_id)
-        if not display_info:
-            self.auto_select_target()
-            if self.target_display_persistent_id:
-                display_info = self.get_display_info(self.target_display_persistent_id)
+                self.auto_select_target()
+                if not self.target_display_persistent_id:
+                    self.notify("Error", "No external display found", "")
+                    return
                 self.queue_update_menu()
+
+            display_info = self.get_display_info(self.target_display_persistent_id)
             if not display_info:
-                self.notify("Error", "Selected display not found", "")
+                self.auto_select_target()
+                if self.target_display_persistent_id:
+                    display_info = self.get_display_info(self.target_display_persistent_id)
+                    self.queue_update_menu()
+                if not display_info:
+                    self.notify("Error", "Selected display not found", "")
+                    return
+
+            current_rotation = int(display_info.get("degree", 0))
+            if current_rotation == target_degree:
+                logging.info(f"Display is already at target degree {target_degree}")
                 return
 
-        current_rotation = int(display_info.get("degree", 0))
-        current_mode = "portrait" if current_rotation in (90, 270) else "landscape"
-        target_mode = "portrait" if target_degree in (90, 270) else "landscape"
+            current_mode = "portrait" if current_rotation in (90, 270) else "landscape"
+            target_mode = "portrait" if target_degree in (90, 270) else "landscape"
 
-        self.save_current_layout(current_mode)
-        saved_layout = self.load_saved_layout(target_mode)
-        if saved_layout:
-            saved_target_degree = extract_display_degree_from_layout_args(
-                saved_layout,
-                self.target_display_persistent_id,
-            )
-            if degree_matches_target_rotation(saved_target_degree, target_degree):
-                for attempt in range(3):
-                    return_code, _, error = self.run_displayplacer(saved_layout)
-                    if return_code == 0 and self.wait_for_rotation(target_degree):
-                        self.save_current_layout(target_mode)
-                        self.notify("Success", f"Restored {target_mode} layout", "")
-                        return
-                    threading.Event().wait(0.5)
-                print(f"Saved layout did not apply target rotation ({target_mode}): {error}")
-            else:
-                print(
-                    f"Ignoring stale saved layout '{target_mode}' "
-                    f"(target display degree: {saved_target_degree})"
+            self.save_current_layout(current_mode)
+            saved_layout = self.load_saved_layout(target_mode)
+            if saved_layout:
+                saved_target_degree = extract_display_degree_from_layout_args(
+                    saved_layout,
+                    self.target_display_persistent_id,
                 )
+                if degree_matches_target_rotation(saved_target_degree, target_degree):
+                    for attempt in range(3):
+                        return_code, _, error = self.run_displayplacer(saved_layout)
+                        if return_code == 0 and self.wait_for_rotation(target_degree):
+                            self.save_current_layout(target_mode)
+                            self.notify("Success", f"Restored {target_mode} layout", "")
+                            return
+                        threading.Event().wait(0.5)
+                    logging.warning(f"Saved layout did not apply target rotation ({target_mode}): {error}")
+                else:
+                    logging.info(
+                        f"Ignoring stale saved layout '{target_mode}' "
+                        f"(target display degree: {saved_target_degree})"
+                    )
 
-                current_resolution = display_info.get("res")
-        if not current_resolution:
-            self.notify("Error", "Could not determine display resolution", "")
-            return
-        current_resolution = str(current_resolution)
-        current_is_portrait = current_rotation in (90, 270)
-        target_is_portrait = target_degree in (90, 270)
-        target_resolution = current_resolution
-
-        if current_is_portrait != target_is_portrait and "x" in current_resolution:
-            width, height = current_resolution.split("x", 1)
-            target_resolution = f"{height}x{width}"
-
-        current_origin = display_info.get("origin", "(0,0)")
-
-        command_arg = (
-            f"id:{self.target_display_persistent_id} "
-            f"res:{target_resolution} origin:{current_origin} degree:{target_degree}"
-        )
-        for attempt in range(3):
-            return_code, _, error = self.run_displayplacer([command_arg])
-            if return_code == 0 and self.wait_for_rotation(target_degree):
-                self.save_current_layout(target_mode)
-                self.notify("Success", f"Target rotated to {target_degree}°", "")
+            current_resolution = display_info.get("res")
+            if not current_resolution:
+                self.notify("Error", "Could not determine display resolution", "")
                 return
-            threading.Event().wait(0.5)
+            current_resolution = str(current_resolution)
+            current_is_portrait = current_rotation in (90, 270)
+            target_is_portrait = target_degree in (90, 270)
+            target_resolution = current_resolution
 
-        self.notify("Failed", "Rotation failed after retries", error[:180] if error else "")
+            if current_is_portrait != target_is_portrait and "x" in current_resolution:
+                width, height = current_resolution.split("x", 1)
+                target_resolution = f"{height}x{width}"
+
+            current_origin = display_info.get("origin", "(0,0)")
+
+            command_arg = (
+                f"id:{self.target_display_persistent_id} "
+                f"res:{target_resolution} origin:{current_origin} degree:{target_degree}"
+            )
+            for attempt in range(3):
+                return_code, _, error = self.run_displayplacer([command_arg])
+                if return_code == 0 and self.wait_for_rotation(target_degree):
+                    self.save_current_layout(target_mode)
+                    self.notify("Success", f"Target rotated to {target_degree}°", "")
+                    return
+                threading.Event().wait(0.5)
+
+            self.notify("Failed", "Rotation failed after retries", error[:180] if error else "")
+        finally:
+            self.action_lock.release()
 
     def toggle(self, _) -> None:
         if not self.target_display_persistent_id:
@@ -577,55 +620,56 @@ class ScreenRotatorApp(rumps.App):
         return None
 
     def start_recording(self, action: str) -> None:
-        self.recording_action = action
-        self.recorded_keys = []
-        self.recorded_non_modifier = False
+        with self.recording_lock:
+            self.recording_action = action
+            self.recorded_keys = []
+            self.recorded_non_modifier = False
 
-        if self.recording_listener:
-            try:
-                self.recording_listener.stop()
-            except Exception:
-                pass
-            self.recording_listener = None
+            if self.recording_listener:
+                try:
+                    self.recording_listener.stop()
+                except Exception:
+                    pass
+                self.recording_listener = None
 
-        self.notify("Record Shortcut", f"Press shortcut for {action.replace('_', ' ')}", "Press Esc to cancel")
+            self.notify("Record Shortcut", f"Press shortcut for {action.replace('_', ' ')}", "Press Esc to cancel")
 
-        def on_press(key):
-            if self.recording_action is None:
-                return False
+            def on_press(key):
+                if self.recording_action is None:
+                    return False
 
-            key_name = self.normalize_key_name(key)
-            if key_name == "esc":
-                self.recording_action = None
-                self.recorded_keys = []
-                self.recorded_non_modifier = False
-                self.notify("Shortcut", "Recording cancelled", "")
-                self.queue_update_menu()
-                return False
-            if not key_name:
+                key_name = self.normalize_key_name(key)
+                if key_name == "esc":
+                    self.recording_action = None
+                    self.recorded_keys = []
+                    self.recorded_non_modifier = False
+                    self.notify("Shortcut", "Recording cancelled", "")
+                    self.queue_update_menu()
+                    return False
+                if not key_name:
+                    return None
+
+                if key_name not in self.recorded_keys:
+                    self.recorded_keys.append(key_name)
+                    if not is_modifier_key_name(key_name):
+                        self.recorded_non_modifier = True
                 return None
 
-            if key_name not in self.recorded_keys:
-                self.recorded_keys.append(key_name)
-                if not is_modifier_key_name(key_name):
-                    self.recorded_non_modifier = True
-            return None
-
-        def on_release(_):
-            if self.recording_action is None:
+            def on_release(_):
+                if self.recording_action is None:
+                    return False
+                if not self.recorded_non_modifier:
+                    return None
+                self.save_recorded_shortcut()
                 return False
-            if not self.recorded_non_modifier:
-                return None
-            self.save_recorded_shortcut()
-            return False
 
-        def start_recording_listener():
-            with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-                self.recording_listener = listener
-                listener.join()
-            self.recording_listener = None
+            def start_recording_listener():
+                with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+                    self.recording_listener = listener
+                    listener.join()
+                self.recording_listener = None
 
-        threading.Thread(target=start_recording_listener, daemon=True).start()
+            threading.Thread(target=start_recording_listener, daemon=True).start()
 
     def save_recorded_shortcut(self) -> None:
         if not self.recording_action or not self.recorded_keys:
@@ -737,11 +781,15 @@ class ScreenRotatorApp(rumps.App):
         self.start_hotkey_listener()
         self.notify("Shortcuts Cleared", "", "")
 
-    def run_command(self, command: Sequence[str]):
+    def run_command(self, command: Sequence[str], timeout: float = 10.0):
         try:
-            result = subprocess.run(command, capture_output=True, text=True)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
             return result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired as error:
+            logging.error(f"Command timed out after {timeout}s: {command}")
+            return -1, "", f"Command timed out: {error}"
         except Exception as error:
+            logging.error(f"Error running command {command}: {error}")
             return -1, "", str(error)
 
     def run_displayplacer(self, args: Sequence[str]):
@@ -752,7 +800,7 @@ class ScreenRotatorApp(rumps.App):
         return os.path.expanduser(f"~/Library/LaunchAgents/{self.LAUNCH_AGENT_LABEL}.plist")
 
     def is_launch_at_login_enabled(self) -> bool:
-        return_code, _, _ = self.run_command(["launchctl", "list", self.LAUNCH_AGENT_LABEL])
+        return_code, _, _ = self.run_command(["launchctl", "list", self.LAUNCH_AGENT_LABEL], timeout=5.0)
         if return_code == 0:
             return True
         return os.path.exists(self.get_launch_agent_path())
@@ -779,11 +827,11 @@ class ScreenRotatorApp(rumps.App):
 
     def load_launch_agent(self):
         launch_agent_path = self.get_launch_agent_path()
-        return self.run_command(["launchctl", "bootstrap", f"gui/{os.getuid()}", launch_agent_path])
+        return self.run_command(["launchctl", "bootstrap", f"gui/{os.getuid()}", launch_agent_path], timeout=5.0)
 
     def unload_launch_agent(self):
         launch_agent_path = self.get_launch_agent_path()
-        return self.run_command(["launchctl", "bootout", f"gui/{os.getuid()}", launch_agent_path])
+        return self.run_command(["launchctl", "bootout", f"gui/{os.getuid()}", launch_agent_path], timeout=5.0)
 
     def toggle_launch_at_login(self, sender) -> None:
         launch_agent_path = self.get_launch_agent_path()
