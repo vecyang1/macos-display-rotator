@@ -12,11 +12,22 @@ import threading
 from typing import Dict, List, Optional, Sequence, Union
 
 import AppKit
+import Foundation
+import objc
 import rumps
 from pynput import keyboard
 from pynput.keyboard import Key, KeyCode
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Setup persistent logging for production debugging
+LOG_FILE = os.path.expanduser("~/screen_rotator_debug.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 ACTION_ROTATIONS = {
     "toggle": None,
@@ -39,6 +50,20 @@ SPECIAL_KEY_DISPLAY = {
     "esc": "⎋",
 }
 STATUS_ITEM_TITLE = "SR"
+
+
+class DisplayObserver(Foundation.NSObject):
+    """Helper class to handle native macOS notification callbacks safely."""
+    def initWithApp_(self, app):
+        self = objc.super(DisplayObserver, self).init()
+        if self:
+            self.app = app
+        return self
+
+    @objc.python_method
+    def displayParametersChanged_(self, notification):
+        logging.info("System display parameters changed, queuing UI update.")
+        self.app.queue_update_menu()
 
 
 def action_to_rotation(action: str) -> Optional[int]:
@@ -143,16 +168,21 @@ class ScreenRotatorApp(rumps.App):
     @rumps.timer(0.2)
     def process_ui_queue(self, _):
         try:
-            while True:
+            while not self.ui_queue.empty():
                 task = self.ui_queue.get_nowait()
-                if task[0] == "notification":
-                    rumps.notification(task[1], task[2], task[3])
-                elif task[0] == "alert":
-                    rumps.alert(task[1], task[2])
-                elif task[0] == "update_menu":
-                    self.update_menu()
+                try:
+                    if task[0] == "notification":
+                        rumps.notification(task[1], task[2], task[3])
+                    elif task[0] == "alert":
+                        rumps.alert(task[1], task[2])
+                    elif task[0] == "update_menu":
+                        self.update_menu()
+                except Exception as e:
+                    logging.error(f"Error processing UI task {task[0]}: {e}")
         except queue.Empty:
             pass
+        except Exception as e:
+            logging.error(f"Critical error in UI queue processor: {e}")
 
     def notify(self, title: str, subtitle: str, message: str = "") -> None:
         self.ui_queue.put(("notification", title, subtitle, message))
@@ -200,20 +230,22 @@ class ScreenRotatorApp(rumps.App):
         self.setup_display_observer()
         self.update_menu()
         self.start_hotkey_listener()
+        logging.info("ScreenRotatorApp initialized successfully.")
 
     def setup_display_observer(self):
         """Listen to native macOS display changes to sync state."""
-        nc = AppKit.NSNotificationCenter.defaultCenter()
-        nc.addObserver_selector_name_object_(
-            self,
-            "displayParametersChanged:",
-            AppKit.NSApplicationDidChangeScreenParametersNotification,
-            None
-        )
-        
-    def displayParametersChanged_(self, notification):
-        logging.info("System display parameters changed, updating UI state.")
-        self.queue_update_menu()
+        try:
+            self.display_observer = DisplayObserver.alloc().initWithApp_(self)
+            nc = AppKit.NSNotificationCenter.defaultCenter()
+            nc.addObserver_selector_name_object_(
+                self.display_observer,
+                "displayParametersChanged:",
+                AppKit.NSApplicationDidChangeScreenParametersNotification,
+                None
+            )
+            logging.info("Native display observer registered.")
+        except Exception as e:
+            logging.error(f"Failed to setup native display observer: {e}")
 
     def find_displayplacer(self) -> Optional[str]:
         displayplacer_path = shutil.which("displayplacer")
@@ -283,9 +315,12 @@ class ScreenRotatorApp(rumps.App):
             self.target_display_persistent_id = displays[0]["persistent_id"]
 
     def update_menu(self) -> None:
+        # Don't refresh menu while recording a shortcut to avoid UI confusion
+        if self.recording_action:
+            return
+
         self.menu.clear()
 
-        # Added threading for menu actions to prevent blocking the main UI thread during rotation
         self.menu.add(
             rumps.MenuItem(
                 f"Toggle Screen  [{self.get_shortcut_display('toggle')}]",
@@ -326,7 +361,6 @@ class ScreenRotatorApp(rumps.App):
         else:
             for display in available_displays:
                 display_type = "External" if display["is_external"] else "Built-in"
-                # If there's an actual rotation, show it in the menu
                 current_degree = display.get("degree", "?")
                 display_name = f"{display['name']} ({display_type}) [{current_degree}°]"
                 
@@ -361,6 +395,8 @@ class ScreenRotatorApp(rumps.App):
         launch_item = rumps.MenuItem("Launch at Login", callback=self.toggle_launch_at_login)
         launch_item.state = self.is_launch_at_login_enabled()
         self.menu.add(launch_item)
+        
+        self.menu.add(rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application()))
 
     def refresh_displays(self, _) -> None:
         available_ids = {display["persistent_id"] for display in self.list_displays()}
@@ -479,6 +515,7 @@ class ScreenRotatorApp(rumps.App):
             return
 
         try:
+            logging.info(f"Initiating rotation to {target_degree}°")
             if target_degree not in (0, 90, 270):
                 self.notify("Invalid Rotation", str(target_degree), "")
                 return
@@ -525,10 +562,7 @@ class ScreenRotatorApp(rumps.App):
                         threading.Event().wait(0.5)
                     logging.warning(f"Saved layout did not apply target rotation ({target_mode}): {error}")
                 else:
-                    logging.info(
-                        f"Ignoring stale saved layout '{target_mode}' "
-                        f"(target display degree: {saved_target_degree})"
-                    )
+                    logging.info(f"Ignoring stale saved layout '{target_mode}'")
 
             current_resolution = display_info.get("res")
             if not current_resolution:
@@ -558,26 +592,22 @@ class ScreenRotatorApp(rumps.App):
                 threading.Event().wait(0.5)
 
             self.notify("Failed", "Rotation failed after retries", error[:180] if error else "")
+        except Exception as e:
+            logging.error(f"Critical error during rotation: {e}")
+            self.notify("Error", "Critical rotation failure", str(e)[:180])
         finally:
             self.action_lock.release()
 
     def toggle(self, _) -> None:
-        if not self.target_display_persistent_id:
-            self.auto_select_target()
-            if not self.target_display_persistent_id:
-                self.notify("Error", "No external display found", "")
-                return
-            self.queue_update_menu()
-
-        display_info = self.get_display_info(self.target_display_persistent_id)
+        display_info = self.get_display_info(self.target_display_persistent_id) if self.target_display_persistent_id else None
         if not display_info:
             self.auto_select_target()
             if self.target_display_persistent_id:
                 display_info = self.get_display_info(self.target_display_persistent_id)
-                self.queue_update_menu()
-            if not display_info:
-                self.notify("Error", "Selected display not found", "")
-                return
+        
+        if not display_info:
+            self.notify("Error", "Target display not found", "")
+            return
 
         target = 0 if int(display_info.get("degree", 0)) in (90, 270) else 90
         self.set_rotation(target)
@@ -589,38 +619,33 @@ class ScreenRotatorApp(rumps.App):
         return "None"
 
     def normalize_key_name(self, key) -> Optional[str]:
-        if isinstance(key, KeyCode) and key.char:
-            return key.char.lower()
+        try:
+            if isinstance(key, KeyCode) and key.char:
+                return key.char.lower()
 
-        key_name_map = {
-            Key.ctrl: "ctrl",
-            Key.ctrl_l: "ctrl",
-            Key.ctrl_r: "ctrl",
-            Key.shift: "shift",
-            Key.shift_l: "shift",
-            Key.shift_r: "shift",
-            Key.cmd: "cmd",
-            Key.cmd_l: "cmd",
-            Key.cmd_r: "cmd",
-            Key.alt: "alt",
-            Key.alt_l: "alt",
-            Key.alt_r: "alt",
-            Key.alt_gr: "alt",
-            Key.space: "space",
-            Key.enter: "enter",
-            Key.tab: "tab",
-            Key.esc: "esc",
-        }
-        if key in key_name_map:
-            return key_name_map[key]
+            key_name_map = {
+                Key.ctrl: "ctrl", Key.ctrl_l: "ctrl", Key.ctrl_r: "ctrl",
+                Key.shift: "shift", Key.shift_l: "shift", Key.shift_r: "shift",
+                Key.cmd: "cmd", Key.cmd_l: "cmd", Key.cmd_r: "cmd",
+                Key.alt: "alt", Key.alt_l: "alt", Key.alt_r: "alt", Key.alt_gr: "alt",
+                Key.space: "space", Key.enter: "enter", Key.tab: "tab", Key.esc: "esc",
+            }
+            if key in key_name_map:
+                return key_name_map[key]
 
-        key_repr = str(key)
-        if key_repr.startswith("Key."):
-            return key_repr.split(".", 1)[1].lower()
+            key_repr = str(key)
+            if key_repr.startswith("Key."):
+                return key_repr.split(".", 1)[1].lower()
+        except Exception as e:
+            logging.error(f"Error normalizing key: {e}")
         return None
 
     def start_recording(self, action: str) -> None:
-        with self.recording_lock:
+        if not self.recording_lock.acquire(blocking=False):
+            logging.info("Recording already in progress.")
+            return
+
+        try:
             self.recording_action = action
             self.recorded_keys = []
             self.recorded_non_modifier = False
@@ -628,103 +653,110 @@ class ScreenRotatorApp(rumps.App):
             if self.recording_listener:
                 try:
                     self.recording_listener.stop()
-                except Exception:
-                    pass
+                except: pass
                 self.recording_listener = None
 
-            self.notify("Record Shortcut", f"Press shortcut for {action.replace('_', ' ')}", "Press Esc to cancel")
+            self.notify("Record Shortcut", f"Press keys for {action.replace('_', ' ')}", "Press Esc to cancel")
 
             def on_press(key):
-                if self.recording_action is None:
-                    return False
+                try:
+                    if self.recording_action is None:
+                        return False
 
-                key_name = self.normalize_key_name(key)
-                if key_name == "esc":
-                    self.recording_action = None
-                    self.recorded_keys = []
-                    self.recorded_non_modifier = False
-                    self.notify("Shortcut", "Recording cancelled", "")
-                    self.queue_update_menu()
-                    return False
-                if not key_name:
+                    key_name = self.normalize_key_name(key)
+                    if key_name == "esc":
+                        self.recording_action = None
+                        self.notify("Shortcut", "Recording cancelled", "")
+                        self.queue_update_menu()
+                        return False
+                    
+                    if key_name and key_name not in self.recorded_keys:
+                        self.recorded_keys.append(key_name)
+                        if not is_modifier_key_name(key_name):
+                            self.recorded_non_modifier = True
                     return None
-
-                if key_name not in self.recorded_keys:
-                    self.recorded_keys.append(key_name)
-                    if not is_modifier_key_name(key_name):
-                        self.recorded_non_modifier = True
-                return None
+                except Exception as e:
+                    logging.error(f"Error in on_press callback: {e}")
+                    return False
 
             def on_release(_):
-                if self.recording_action is None:
+                try:
+                    if self.recording_action is None:
+                        return False
+                    if not self.recorded_non_modifier:
+                        return None
+                    self.save_recorded_shortcut()
                     return False
-                if not self.recorded_non_modifier:
-                    return None
-                self.save_recorded_shortcut()
-                return False
+                except Exception as e:
+                    logging.error(f"Error in on_release callback: {e}")
+                    return False
 
             def start_recording_listener():
-                with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-                    self.recording_listener = listener
-                    listener.join()
-                self.recording_listener = None
+                try:
+                    logging.info(f"Starting recording listener for {action}")
+                    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+                        self.recording_listener = listener
+                        listener.join()
+                except Exception as e:
+                    logging.error(f"Recording listener crashed: {e}")
+                    self.notify("Error", "Recording failed", str(e))
+                finally:
+                    self.recording_listener = None
+                    if self.recording_lock.locked():
+                        self.recording_lock.release()
 
             threading.Thread(target=start_recording_listener, daemon=True).start()
+        except Exception as e:
+            logging.error(f"Failed to start recording thread: {e}")
+            if self.recording_lock.locked():
+                self.recording_lock.release()
 
     def save_recorded_shortcut(self) -> None:
-        if not self.recording_action or not self.recorded_keys:
-            return
+        try:
+            if not self.recording_action or not self.recorded_keys:
+                return
 
-        ordered_keys = order_shortcut_keys(self.recorded_keys)
-        if not any(not is_modifier_key_name(key) for key in ordered_keys):
-            self.notify("Invalid Shortcut", "Use at least one non-modifier key", "")
+            ordered_keys = order_shortcut_keys(self.recorded_keys)
+            if not any(not is_modifier_key_name(key) for key in ordered_keys):
+                self.notify("Invalid Shortcut", "Use at least one non-modifier key", "")
+                return
+
+            action = self.recording_action
+            display = format_shortcut_display(ordered_keys)
+            
+            with threading.Lock(): # Local atomic update
+                self.shortcuts[action] = {"keys": ordered_keys, "display": display}
+            
             self.recording_action = None
-            self.recorded_keys = []
-            self.recorded_non_modifier = False
-            return
-
-        action = self.recording_action
-        display = format_shortcut_display(ordered_keys)
-        self.shortcuts[action] = {"keys": ordered_keys, "display": display}
-        self.recording_action = None
-        self.recorded_keys = []
-        self.recorded_non_modifier = False
-
-        self.save_config()
-        self.queue_update_menu()
-        self.start_hotkey_listener()
-        self.notify("Shortcut Saved", action.replace("_", " ").title(), display)
+            self.save_config()
+            self.queue_update_menu()
+            self.start_hotkey_listener()
+            self.notify("Shortcut Saved", action.replace("_", " ").title(), display)
+            logging.info(f"Shortcut saved for {action}: {display}")
+        except Exception as e:
+            logging.error(f"Error saving shortcut: {e}")
 
     def key_name_to_pynput_key(self, key_name: str):
         normalized = key_name.lower()
         mapping = {
-            "ctrl": Key.ctrl,
-            "shift": Key.shift,
-            "alt": Key.alt,
-            "cmd": Key.cmd,
-            "space": Key.space,
-            "enter": Key.enter,
-            "tab": Key.tab,
-            "esc": Key.esc,
+            "ctrl": Key.ctrl, "shift": Key.shift, "alt": Key.alt, "cmd": Key.cmd,
+            "space": Key.space, "enter": Key.enter, "tab": Key.tab, "esc": Key.esc,
         }
-        if normalized in mapping:
-            return mapping[normalized]
-        if len(normalized) == 1:
-            return KeyCode.from_char(normalized)
-        if hasattr(Key, normalized):
-            return getattr(Key, normalized)
+        if normalized in mapping: return mapping[normalized]
+        if len(normalized) == 1: return KeyCode.from_char(normalized)
+        if hasattr(Key, normalized): return getattr(Key, normalized)
         return None
 
     def parse_hotkey_keys(self, key_names: Sequence[str]):
         parsed = set()
         for key_name in order_shortcut_keys(key_names):
             key_value = self.key_name_to_pynput_key(key_name)
-            if key_value is None:
-                return None
+            if key_value is None: return None
             parsed.add(key_value)
         return parsed or None
 
     def execute_shortcut_action(self, action: str) -> None:
+        logging.info(f"Executing shortcut action: {action}")
         target_rotation = action_to_rotation(action)
         if action == "toggle":
             threading.Thread(target=self.toggle, args=(None,), daemon=True).start()
@@ -732,46 +764,49 @@ class ScreenRotatorApp(rumps.App):
             threading.Thread(target=self.set_rotation, args=(target_rotation,), daemon=True).start()
 
     def handle_hotkey_event(self, hotkeys: Sequence[keyboard.HotKey], key, is_press: bool) -> None:
-        listener = self.hotkey_listener
-        if not listener:
-            return
-        canonical = listener.canonical(key)
-        for hotkey in hotkeys:
-            if is_press:
-                hotkey.press(canonical)
-            else:
-                hotkey.release(canonical)
+        try:
+            listener = self.hotkey_listener
+            if not listener:
+                return
+            canonical = listener.canonical(key)
+            for hotkey in hotkeys:
+                if is_press:
+                    hotkey.press(canonical)
+                else:
+                    hotkey.release(canonical)
+        except Exception as e:
+            logging.error(f"Error in hotkey event handler: {e}")
 
     def start_hotkey_listener(self) -> None:
-        if self.hotkey_listener:
-            try:
-                self.hotkey_listener.stop()
-            except Exception:
-                pass
-            self.hotkey_listener = None
+        try:
+            if self.hotkey_listener:
+                try: self.hotkey_listener.stop()
+                except: pass
+                self.hotkey_listener = None
 
-        hotkeys = []
-        for action, shortcut in self.shortcuts.items():
-            if not isinstance(shortcut, dict):
-                continue
-            keys = shortcut.get("keys")
-            if not isinstance(keys, list):
-                continue
-            parsed = self.parse_hotkey_keys(keys)
-            if not parsed:
-                continue
-            hotkeys.append(
-                keyboard.HotKey(parsed, lambda action_name=action: self.execute_shortcut_action(action_name))
+            hotkeys = []
+            for action, shortcut in self.shortcuts.items():
+                if not isinstance(shortcut, dict): continue
+                keys = shortcut.get("keys")
+                if not isinstance(keys, list): continue
+                parsed = self.parse_hotkey_keys(keys)
+                if not parsed: continue
+                
+                hotkeys.append(
+                    keyboard.HotKey(parsed, lambda action_name=action: self.execute_shortcut_action(action_name))
+                )
+
+            if not hotkeys:
+                return
+
+            self.hotkey_listener = keyboard.Listener(
+                on_press=lambda key: self.handle_hotkey_event(hotkeys, key, True),
+                on_release=lambda key: self.handle_hotkey_event(hotkeys, key, False),
             )
-
-        if not hotkeys:
-            return
-
-        self.hotkey_listener = keyboard.Listener(
-            on_press=lambda key: self.handle_hotkey_event(hotkeys, key, True),
-            on_release=lambda key: self.handle_hotkey_event(hotkeys, key, False),
-        )
-        self.hotkey_listener.start()
+            self.hotkey_listener.start()
+            logging.info("Global hotkey listener started.")
+        except Exception as e:
+            logging.error(f"Failed to start hotkey listener: {e}")
 
     def clear_all_shortcuts(self, _) -> None:
         for action in self.shortcuts:
@@ -801,15 +836,12 @@ class ScreenRotatorApp(rumps.App):
 
     def is_launch_at_login_enabled(self) -> bool:
         return_code, _, _ = self.run_command(["launchctl", "list", self.LAUNCH_AGENT_LABEL], timeout=5.0)
-        if return_code == 0:
-            return True
+        if return_code == 0: return True
         return os.path.exists(self.get_launch_agent_path())
 
     def get_launch_program_arguments(self) -> List[str]:
         if getattr(sys, "frozen", False):
-            app_bundle_path = os.path.abspath(
-                os.path.join(os.path.dirname(sys.executable), "..", "..", "..")
-            )
+            app_bundle_path = os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", "..", ".."))
             return ["/usr/bin/open", "-a", app_bundle_path]
         return [sys.executable, os.path.abspath(__file__)]
 
@@ -854,8 +886,12 @@ class ScreenRotatorApp(rumps.App):
             self.notify("Launch at Login", "Enabled", "")
         except Exception as error:
             sender.state = 0
+            logging.error(f"Failed to enable launch at login: {error}")
             self.notify("Launch at Login", "Failed to enable", str(error)[:180])
 
 
 if __name__ == "__main__":
-    ScreenRotatorApp().run()
+    try:
+        ScreenRotatorApp().run()
+    except Exception as e:
+        logging.critical(f"Application main loop crashed: {e}")
