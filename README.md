@@ -1,99 +1,62 @@
-# Screen Rotator 🔄
+# Screen Rotator 🔄 [v2.2]
 
-A simple macOS menu bar app to **one-click rotate** your external display between horizontal and vertical. Perfect for viewing short videos or reading documents.
+The ultimate macOS utility for **instant display orientation control**. Seamlessly switch your external monitors between landscape and portrait with a single click or a global hotkey.
 
-## Features
+Designed for developers, researchers, and content consumers who need to flip their perspective without diving into System Settings.
 
-- ✅ **One-click rotation** - Toggle between Standard (0°) and Vertical (90°/270°)
-- ✅ **Menu bar app** - Lives in your menu bar, always accessible
-- ✅ **Custom global hotkeys** - Record any keyboard shortcut you want
-- ✅ **Remembers position** - Saves your display arrangement for each orientation
-- ✅ **Launch at Login** - Start automatically when you log in
-- ✅ **No default shortcuts** - You choose your own hotkeys
+## ✨ What's New in v2.2
 
-## Installation
+- 🖥️ **Native Settings Panel**: A professional Cocoa-based settings window for intuitive shortcut management. No more confusing menu-item recording!
+- ⚡ **Zero-Latency State Sync**: Integrated with macOS system observers. The menu bar now stays perfectly in sync even if you rotate your screen via System Settings or hardware changes.
+- 🧵 **Hardened Concurrency**: Full background threading for all rotation commands. Your UI stays buttery smooth and never "beachballs" during layout changes.
+- 🛡️ **Production-Grade Stability**: Added thread-locks to prevent race conditions and 10s timeouts for external utility calls to prevent application hangs.
 
-### 📦 Download Pre-built App (Easiest)
+## 🚀 Key Features
 
-1. **[Download ScreenRotator v1.1.1](https://github.com/vecyang1/macos-display-rotator/releases/latest)** (24MB)
-2. Unzip and move **ScreenRotator.app** to your `/Applications` folder
-3. Install `displayplacer`:
-   ```bash
-   brew install jakehilborn/jakehilborn/displayplacer
-   ```
-4. Open **ScreenRotator.app**
-5. Grant **Accessibility permissions** when prompted:
-   - System Settings → Privacy & Security → Accessibility → Enable for ScreenRotator
+- ✅ **One-Click Toggle**: Instantly flip between Standard (0°) and Vertical (90°/270°).
+- ✅ **Global Hotkeys**: Custom keyboard shortcuts that work anywhere in macOS.
+- ✅ **Smart Layout Memory**: Remembers your exact window arrangement and display origin for *every* orientation.
+- ✅ **Automatic Sync**: Real-time monitoring of display parameters.
+- ✅ **Launch at Login**: Ready to go the moment you start your Mac.
+- ✅ **Privacy First**: Local execution with zero tracking or external API calls.
 
-### 🛠️ Build from Source (Advanced)
+## 📦 Installation
 
-1. Clone this repo:
-   ```bash
-   git clone https://github.com/vecyang1/macos-display-rotator.git
-   cd macos-display-rotator
-   ```
+### 1. Download Pre-built App
+1. **[Download ScreenRotator v2.2](https://github.com/vecyang1/macos-display-rotator/releases/latest)**
+2. Move **ScreenRotator.app** to your `/Applications` folder.
 
-2. Install dependencies:
-   ```bash
-   brew install jakehilborn/jakehilborn/displayplacer
-   pip3 install rumps pynput py2app
-   ```
+### 2. Install Dependency
+The app uses the highly reliable `displayplacer` engine:
+```bash
+brew install jakehilborn/jakehilborn/displayplacer
+```
 
-3. Build the app:
-   ```bash
-   python3 setup.py py2app
-   ```
+### 3. Grant Permissions
+Because the app listens for hotkeys, you must grant **Accessibility permissions**:
+- **System Settings** → **Privacy & Security** → **Accessibility** → Enable **ScreenRotator**.
 
-4. Find your app in `dist/ScreenRotator.app`
+## 🛠️ Usage
 
+1. Find the **SR** icon in your menu bar.
+2. **Left-click** to access rotation presets or refresh your display list.
+3. Select **"Settings..."** to open the new Shortcut Panel.
 
-## Usage
+### Setting Up Hotkeys (The Easy Way)
+1. Open **Settings...** from the menu bar.
+2. Click **"Set"** next to an action (e.g., Toggle).
+3. The status will change to **"Recording..."**—simply press your keys (e.g., `Cmd+Option+R`).
+4. Shortcuts are saved instantly!
 
-1. Look for the **🔄** icon in your menu bar
-2. Click to see options:
-   - **Toggle** - Switch between horizontal/vertical
-   - **Rotate 90°** - Make screen vertical
-   - **Rotate Standard** - Make screen horizontal
-   - **Rotate 270°** - Vertical (opposite direction)
+## 🔧 Troubleshooting
 
-### Setting Up Keyboard Shortcuts
+- **"SR" icon shows [?]**: Click **Refresh Displays** to re-scan your connected hardware.
+- **Shortcuts not triggering?**: Ensure ScreenRotator is enabled in Accessibility settings and that another app isn't hogging the same key combination.
+- **Need Logs?**: Check `~/screen_rotator_debug.log` for a detailed trace of application activity.
 
-1. Click 🔄 → **Set Shortcuts**
-2. Click **"Record Toggle Shortcut..."** (or any action)
-3. Press your desired key combination (e.g., Ctrl+Shift+R)
-4. Done! The shortcut is now active globally
+## 📜 License
+MIT License - Open, free, and lightweight.
 
-### Launch at Login
-
-1. Click 🔄 → **Launch at Login**
-2. A checkmark appears when enabled
-3. The app will start automatically on login
-
-## Requirements
-
-- macOS 10.13 or later
-- Python 3.8 or later
-- An external display
-
-## Troubleshooting
-
-**App doesn't find my display?**
-- Make sure your external display is connected
-- The app auto-detects displays marked as "external" by macOS
-
-**Shortcuts don't work?**
-- Grant Accessibility permissions: System Settings → Privacy & Security → Accessibility → Enable for Terminal/Python
-
-**displayplacer not found?**
-- Run: `brew install jakehilborn/jakehilborn/displayplacer`
-
-## License
-
-MIT License - Free to use and modify.
-
-## Credits
-
-Built with:
-- [rumps](https://github.com/jaredks/rumps) - Menu bar apps
-- [pynput](https://github.com/moses-palmer/pynput) - Keyboard input
-- [displayplacer](https://github.com/jakehilborn/displayplacer) - Display control
+---
+Built with ❤️ for the macOS community.
+Powered by [rumps](https://github.com/jaredks/rumps), [pynput](https://github.com/moses-palmer/pynput), and [displayplacer](https://github.com/jakehilborn/displayplacer).
