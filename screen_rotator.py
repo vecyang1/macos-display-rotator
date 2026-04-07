@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import queue
 import threading
 from typing import Dict, List, Optional, Sequence, Union
@@ -36,6 +37,14 @@ ACTION_ROTATIONS = {
     "rotate_270": 270,
 }
 
+# Single source of truth for action display names
+ACTION_LABELS = [
+    ("toggle", "Toggle Screen", "Toggle"),
+    ("rotate_0", "Rotate Standard (0°)", "0°"),
+    ("rotate_90", "Rotate Vertical (90°)", "90°"),
+    ("rotate_270", "Rotate Vertical (270°)", "270°"),
+]
+
 MODIFIER_ORDER = ("ctrl", "shift", "alt", "cmd")
 MODIFIER_SYMBOLS = {
     "ctrl": "⌃",
@@ -50,6 +59,20 @@ SPECIAL_KEY_DISPLAY = {
     "esc": "⎋",
 }
 STATUS_ITEM_TITLE = "SR"
+
+# Constant key mappings (hoisted to module level to avoid per-call reconstruction)
+_KEY_NAME_MAP = {
+    Key.ctrl: "ctrl", Key.ctrl_l: "ctrl", Key.ctrl_r: "ctrl",
+    Key.shift: "shift", Key.shift_l: "shift", Key.shift_r: "shift",
+    Key.cmd: "cmd", Key.cmd_l: "cmd", Key.cmd_r: "cmd",
+    Key.alt: "alt", Key.alt_l: "alt", Key.alt_r: "alt", Key.alt_gr: "alt",
+    Key.space: "space", Key.enter: "enter", Key.tab: "tab", Key.esc: "esc",
+}
+
+_PYNPUT_KEY_MAP = {
+    "ctrl": Key.ctrl, "shift": Key.shift, "alt": Key.alt, "cmd": Key.cmd,
+    "space": Key.space, "enter": Key.enter, "tab": Key.tab, "esc": Key.esc,
+}
 
 
 class DisplayObserver(Foundation.NSObject):
@@ -100,8 +123,6 @@ def format_shortcut_display(keys: Sequence[str]) -> str:
             display_parts.append(MODIFIER_SYMBOLS[key])
         elif key in SPECIAL_KEY_DISPLAY:
             display_parts.append(SPECIAL_KEY_DISPLAY[key])
-        elif len(key) == 1:
-            display_parts.append(key.upper())
         else:
             display_parts.append(key.upper())
     return "".join(display_parts)
@@ -176,6 +197,7 @@ class ScreenRotatorApp(rumps.App):
                     elif task[0] == "alert":
                         rumps.alert(task[1], task[2])
                     elif task[0] == "update_menu":
+                        self._menu_update_pending = False
                         self.update_menu()
                 except Exception as e:
                     logging.error(f"Error processing UI task {task[0]}: {e}")
@@ -191,11 +213,14 @@ class ScreenRotatorApp(rumps.App):
         self.ui_queue.put(("alert", title, message))
 
     def queue_update_menu(self) -> None:
-        self.ui_queue.put(("update_menu",))
+        if not self._menu_update_pending:
+            self._menu_update_pending = True
+            self.ui_queue.put(("update_menu",))
 
     def __init__(self):
         super().__init__(STATUS_ITEM_TITLE, icon=None)
         self.ui_queue = queue.Queue()
+        self._menu_update_pending = False
         self.action_lock = threading.Lock()
         self.recording_lock = threading.Lock()
         
@@ -222,7 +247,11 @@ class ScreenRotatorApp(rumps.App):
         self.recorded_non_modifier = False
         self.recording_listener: Optional[keyboard.Listener] = None
         self.hotkey_listener: Optional[keyboard.Listener] = None
-        self.recording_done_callback = None
+
+        # Built-in display rotation safety: auto-revert after 15s if not confirmed
+        self._revert_timer: Optional[threading.Timer] = None
+        self._revert_degree: Optional[int] = None
+        self._revert_layout: Optional[List[str]] = None
 
         self.load_config()
         if not self.target_display_persistent_id:
@@ -315,6 +344,15 @@ class ScreenRotatorApp(rumps.App):
         if displays:
             self.target_display_persistent_id = displays[0]["persistent_id"]
 
+    def _is_target_built_in(self) -> bool:
+        """Check if the current target display is the MacBook built-in screen."""
+        if not self.target_display_persistent_id:
+            return False
+        for display in self.list_displays():
+            if display["persistent_id"] == self.target_display_persistent_id:
+                return bool(display.get("is_built_in", False))
+        return False
+
     def update_menu(self) -> None:
         # Don't refresh menu while recording a shortcut to avoid UI confusion
         if self.recording_action:
@@ -322,31 +360,31 @@ class ScreenRotatorApp(rumps.App):
 
         self.menu.clear()
 
-        self.menu.add(
-            rumps.MenuItem(
-                f"Toggle Screen  [{self.get_shortcut_display('toggle')}]",
-                callback=lambda _: threading.Thread(target=self.toggle, args=(None,), daemon=True).start(),
-            )
-        )
-        self.menu.add(rumps.separator)
-        self.menu.add(
-            rumps.MenuItem(
-                f"Rotate Standard (0°)  [{self.get_shortcut_display('rotate_0')}]",
-                callback=lambda _: threading.Thread(target=self.set_rotation, args=(0,), daemon=True).start(),
-            )
-        )
-        self.menu.add(
-            rumps.MenuItem(
-                f"Rotate Vertical (90°)  [{self.get_shortcut_display('rotate_90')}]",
-                callback=lambda _: threading.Thread(target=self.set_rotation, args=(90,), daemon=True).start(),
-            )
-        )
-        self.menu.add(
-            rumps.MenuItem(
-                f"Rotate Vertical (270°)  [{self.get_shortcut_display('rotate_270')}]",
-                callback=lambda _: threading.Thread(target=self.set_rotation, args=(270,), daemon=True).start(),
-            )
-        )
+        # Show confirmation controls when a built-in display revert is pending
+        if self._revert_timer and self._revert_timer.is_alive():
+            self.menu.add(rumps.MenuItem(
+                "Keep Rotation",
+                callback=self._confirm_rotation,
+            ))
+            self.menu.add(rumps.MenuItem(
+                "Revert Now",
+                callback=self._revert_now,
+            ))
+            self.menu.add(rumps.separator)
+
+        for action_id, menu_label, _ in ACTION_LABELS:
+            rotation = ACTION_ROTATIONS[action_id]
+            if action_id == "toggle":
+                target, args = self.toggle, (None,)
+            else:
+                target, args = self.set_rotation, (rotation,)
+            shortcut = self.get_shortcut_display(action_id)
+            self.menu.add(rumps.MenuItem(
+                f"{menu_label}  [{shortcut}]",
+                callback=lambda _, t=target, a=args: threading.Thread(target=t, args=a, daemon=True).start(),
+            ))
+            if action_id == "toggle":
+                self.menu.add(rumps.separator)
         self.menu.add(rumps.separator)
 
         displays_menu = rumps.MenuItem("Target Display")
@@ -376,12 +414,13 @@ class ScreenRotatorApp(rumps.App):
         self.menu.add(rumps.MenuItem("Refresh Displays", callback=self.refresh_displays))
         self.menu.add(rumps.separator)
 
-        # Simplified settings menu that won't crash
+        # Menu-based settings avoids AppKit NSWindow threading crashes (see commit 0c970d8)
         settings_menu = rumps.MenuItem("Settings...")
-        settings_menu.add(rumps.MenuItem("Record Toggle...", callback=lambda _: self.start_recording("toggle")))
-        settings_menu.add(rumps.MenuItem("Record 0°...", callback=lambda _: self.start_recording("rotate_0")))
-        settings_menu.add(rumps.MenuItem("Record 90°...", callback=lambda _: self.start_recording("rotate_90")))
-        settings_menu.add(rumps.MenuItem("Record 270°...", callback=lambda _: self.start_recording("rotate_270")))
+        for action_id, _, short_label in ACTION_LABELS:
+            settings_menu.add(rumps.MenuItem(
+                f"Record {short_label}...",
+                callback=lambda _, aid=action_id: self.start_recording(aid),
+            ))
         settings_menu.add(rumps.separator)
         settings_menu.add(rumps.MenuItem("Clear All Shortcuts", callback=self.clear_all_shortcuts))
         self.menu.add(settings_menu)
@@ -501,8 +540,74 @@ class ScreenRotatorApp(rumps.App):
             current_degree = int(info.get("degree", -1)) if info else None
             if degree_matches_target_rotation(current_degree, target_degree):
                 return True
-            threading.Event().wait(0.2)
+            time.sleep(0.2)
         return False
+
+    def _get_full_restore_command(self) -> Optional[List[str]]:
+        """Capture the current full displayplacer restore command."""
+        _, output, _ = self.run_displayplacer(["list"])
+        for line in reversed(output.strip().splitlines()):
+            if line.strip().startswith("displayplacer"):
+                return parse_saved_layout_command(line.strip())
+        return None
+
+    def _start_revert_countdown(self, previous_degree: int, restore_layout: List[str], target_degree: int) -> None:
+        """Start 15s auto-revert for built-in display rotation safety."""
+        # Cancel any existing revert timer
+        if self._revert_timer:
+            self._revert_timer.cancel()
+
+        self._revert_degree = previous_degree
+        self._revert_layout = restore_layout
+        self._revert_timer = threading.Timer(15.0, self._auto_revert)
+        self._revert_timer.daemon = True
+        self._revert_timer.start()
+        self.queue_update_menu()
+        self.notify(
+            "Confirm Rotation",
+            f"Rotated to {target_degree}° — reverting in 15s",
+            "Click 'Keep Rotation' in menu to confirm",
+        )
+        logging.info(f"Built-in display revert countdown started (15s). Previous: {previous_degree}°")
+
+    def _auto_revert(self) -> None:
+        """Called by the 15s timer — revert built-in display to previous rotation."""
+        layout = self._revert_layout
+        degree = self._revert_degree
+        self._revert_timer = None
+        self._revert_degree = None
+        self._revert_layout = None
+
+        if not layout:
+            logging.warning("Auto-revert triggered but no restore layout saved.")
+            return
+
+        logging.info(f"Auto-reverting built-in display to {degree}°")
+        return_code, _, error = self.run_displayplacer(layout)
+        if return_code == 0:
+            self.notify("Rotation Reverted", f"Reverted to {degree}°", "No confirmation received")
+        else:
+            logging.error(f"Auto-revert failed: {error}")
+            self.notify("Revert Failed", "Could not restore previous rotation", error[:120] if error else "")
+        self.queue_update_menu()
+
+    def _confirm_rotation(self, _) -> None:
+        """User confirmed the rotation — cancel the revert timer."""
+        if self._revert_timer:
+            self._revert_timer.cancel()
+        self._revert_timer = None
+        self._revert_degree = None
+        self._revert_layout = None
+        self.notify("Rotation Confirmed", "Display rotation kept", "")
+        self.queue_update_menu()
+        logging.info("User confirmed built-in display rotation.")
+
+    def _revert_now(self, _) -> None:
+        """User clicked Revert Now — immediately revert."""
+        if self._revert_timer:
+            self._revert_timer.cancel()
+            self._revert_timer = None
+        self._auto_revert()
 
     def set_rotation(self, target_degree: int) -> None:
         if not self.action_lock.acquire(blocking=False):
@@ -537,6 +642,12 @@ class ScreenRotatorApp(rumps.App):
                 logging.info(f"Display is already at target degree {target_degree}")
                 return
 
+            # Check if this is a built-in display (needs confirmation for non-standard rotation)
+            is_built_in = self._is_target_built_in()
+            pre_rotation_layout: Optional[List[str]] = None
+            if is_built_in and target_degree != 0:
+                pre_rotation_layout = self._get_full_restore_command()
+
             current_mode = "portrait" if current_rotation in (90, 270) else "landscape"
             target_mode = "portrait" if target_degree in (90, 270) else "landscape"
 
@@ -552,9 +663,12 @@ class ScreenRotatorApp(rumps.App):
                         return_code, _, error = self.run_displayplacer(saved_layout)
                         if return_code == 0 and self.wait_for_rotation(target_degree):
                             self.save_current_layout(target_mode)
-                            self.notify("Success", f"Restored {target_mode} layout", "")
+                            if is_built_in and target_degree != 0 and pre_rotation_layout:
+                                self._start_revert_countdown(current_rotation, pre_rotation_layout, target_degree)
+                            else:
+                                self.notify("Success", f"Restored {target_mode} layout", "")
                             return
-                        threading.Event().wait(0.5)
+                        time.sleep(0.5)
                     logging.warning(f"Saved layout did not apply target rotation ({target_mode}): {error}")
                 else:
                     logging.info(f"Ignoring stale saved layout '{target_mode}'")
@@ -582,9 +696,12 @@ class ScreenRotatorApp(rumps.App):
                 return_code, _, error = self.run_displayplacer([command_arg])
                 if return_code == 0 and self.wait_for_rotation(target_degree):
                     self.save_current_layout(target_mode)
-                    self.notify("Success", f"Target rotated to {target_degree}°", "")
+                    if is_built_in and target_degree != 0 and pre_rotation_layout:
+                        self._start_revert_countdown(current_rotation, pre_rotation_layout, target_degree)
+                    else:
+                        self.notify("Success", f"Target rotated to {target_degree}°", "")
                     return
-                threading.Event().wait(0.5)
+                time.sleep(0.5)
 
             self.notify("Failed", "Rotation failed after retries", error[:180] if error else "")
         except Exception as e:
@@ -618,15 +735,8 @@ class ScreenRotatorApp(rumps.App):
             if isinstance(key, KeyCode) and key.char:
                 return key.char.lower()
 
-            key_name_map = {
-                Key.ctrl: "ctrl", Key.ctrl_l: "ctrl", Key.ctrl_r: "ctrl",
-                Key.shift: "shift", Key.shift_l: "shift", Key.shift_r: "shift",
-                Key.cmd: "cmd", Key.cmd_l: "cmd", Key.cmd_r: "cmd",
-                Key.alt: "alt", Key.alt_l: "alt", Key.alt_r: "alt", Key.alt_gr: "alt",
-                Key.space: "space", Key.enter: "enter", Key.tab: "tab", Key.esc: "esc",
-            }
-            if key in key_name_map:
-                return key_name_map[key]
+            if key in _KEY_NAME_MAP:
+                return _KEY_NAME_MAP[key]
 
             key_repr = str(key)
             if key_repr.startswith("Key."):
@@ -635,7 +745,7 @@ class ScreenRotatorApp(rumps.App):
             logging.error(f"Error normalizing key: {e}")
         return None
 
-    def start_recording(self, action: str, callback=None) -> None:
+    def start_recording(self, action: str) -> None:
         if not self.recording_lock.acquire(blocking=False):
             logging.info("Recording already in progress.")
             return
@@ -644,15 +754,16 @@ class ScreenRotatorApp(rumps.App):
             self.recording_action = action
             self.recorded_keys = []
             self.recorded_non_modifier = False
-            self.recording_done_callback = callback
 
             if self.recording_listener:
                 try:
                     self.recording_listener.stop()
-                except: pass
+                except Exception:
+                    pass
                 self.recording_listener = None
 
-            # Safe notification without blocking UI thread
+            # Use self.notify() (queue-based) — recording runs on a background thread
+            # and rumps.notification() is not thread-safe
             self.notify("Record Shortcut", f"Press keys for {action.replace('_', ' ')}", "Press Esc to cancel")
 
             def on_press(key):
@@ -665,8 +776,6 @@ class ScreenRotatorApp(rumps.App):
                         self.recording_action = None
                         self.notify("Shortcut", "Recording cancelled", "")
                         self.queue_update_menu()
-                        if self.recording_done_callback:
-                            self.recording_done_callback()
                         return False
                     
                     if key_name and key_name not in self.recorded_keys:
@@ -730,9 +839,6 @@ class ScreenRotatorApp(rumps.App):
             self.queue_update_menu()
             self.start_hotkey_listener()
             
-            if self.recording_done_callback:
-                self.recording_done_callback()
-            
             self.notify("Shortcut Saved", action.replace("_", " ").title(), display)
             logging.info(f"Shortcut saved for {action}: {display}")
         except Exception as e:
@@ -740,13 +846,12 @@ class ScreenRotatorApp(rumps.App):
 
     def key_name_to_pynput_key(self, key_name: str):
         normalized = key_name.lower()
-        mapping = {
-            "ctrl": Key.ctrl, "shift": Key.shift, "alt": Key.alt, "cmd": Key.cmd,
-            "space": Key.space, "enter": Key.enter, "tab": Key.tab, "esc": Key.esc,
-        }
-        if normalized in mapping: return mapping[normalized]
-        if len(normalized) == 1: return KeyCode.from_char(normalized)
-        if hasattr(Key, normalized): return getattr(Key, normalized)
+        if normalized in _PYNPUT_KEY_MAP:
+            return _PYNPUT_KEY_MAP[normalized]
+        if len(normalized) == 1:
+            return KeyCode.from_char(normalized)
+        if hasattr(Key, normalized):
+            return getattr(Key, normalized)
         return None
 
     def parse_hotkey_keys(self, key_names: Sequence[str]):
@@ -782,8 +887,10 @@ class ScreenRotatorApp(rumps.App):
     def start_hotkey_listener(self) -> None:
         try:
             if self.hotkey_listener:
-                try: self.hotkey_listener.stop()
-                except: pass
+                try:
+                    self.hotkey_listener.stop()
+                except Exception:
+                    pass
                 self.hotkey_listener = None
 
             hotkeys = []
