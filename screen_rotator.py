@@ -430,7 +430,6 @@ class ScreenRotatorApp(rumps.App):
         launch_item.state = self.is_launch_at_login_enabled()
         self.menu.add(launch_item)
         
-        self.menu.add(rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application()))
 
     def refresh_displays(self, _) -> None:
         available_ids = {display["persistent_id"] for display in self.list_displays()}
@@ -551,6 +550,25 @@ class ScreenRotatorApp(rumps.App):
                 return parse_saved_layout_command(line.strip())
         return None
 
+    def _show_revert_dialog(self, target_degree: int) -> None:
+        """Show blocking AppleScript popup dialog in a background thread."""
+        script = (
+            f'display dialog "Built-in display rotated to {target_degree}°.\\n\\n'
+            f'The trackpad direction does not change with screen rotation.\\n'
+            f'Auto-reverting in 15 seconds unless confirmed." '
+            f'with title "Confirm Display Rotation" '
+            f'buttons {{"Revert Now", "Keep Rotation"}} '
+            f'default button "Keep Rotation" '
+            f'giving up after 15'
+        )
+        result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+        output = result.stdout.strip()
+        if 'Revert Now' in output:
+            self._revert_now(None)
+        elif 'Keep Rotation' in output:
+            self._confirm_rotation(None)
+        # gave up / error: timer already handles revert
+
     def _start_revert_countdown(self, previous_degree: int, restore_layout: List[str], target_degree: int) -> None:
         """Start 15s auto-revert for built-in display rotation safety."""
         # Cancel any existing revert timer
@@ -563,11 +581,9 @@ class ScreenRotatorApp(rumps.App):
         self._revert_timer.daemon = True
         self._revert_timer.start()
         self.queue_update_menu()
-        self.notify(
-            "Confirm Rotation",
-            f"Rotated to {target_degree}° — reverting in 15s",
-            "Click 'Keep Rotation' in menu to confirm",
-        )
+        # Show popup dialog in background so it doesn't block the main thread
+        dialog_thread = threading.Thread(target=self._show_revert_dialog, args=(target_degree,), daemon=True)
+        dialog_thread.start()
         logging.info(f"Built-in display revert countdown started (15s). Previous: {previous_degree}°")
 
     def _auto_revert(self) -> None:
