@@ -89,6 +89,177 @@ class DisplayObserver(Foundation.NSObject):
         self.app.queue_update_menu()
 
 
+class SettingsWindow(Foundation.NSObject):
+    """Thread-safe native macOS Settings Panel.
+
+    All UI mutations run on the main thread — either from NSButton actions
+    (already main-thread) or via the app's ui_queue timer (main-thread).
+    The pynput recording thread never touches AppKit directly.
+    """
+
+    def initWithApp_(self, app):
+        self = objc.super(SettingsWindow, self).init()
+        if self:
+            self.app = app
+            self.window = None
+            self.labels = {}
+            self.set_buttons = {}
+        return self
+
+    @objc.python_method
+    def show(self):
+        if self.window and self.window.isVisible():
+            self.window.makeKeyAndOrderFront_(None)
+            AppKit.NSApp.activateIgnoringOtherApps_(True)
+            return
+
+        width, height = 460, 290
+        mask = (AppKit.NSTitledWindowMask |
+                AppKit.NSClosableWindowMask |
+                AppKit.NSMiniaturizableWindowMask)
+
+        self.window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            Foundation.NSMakeRect(0, 0, width, height),
+            mask,
+            AppKit.NSBackingStoreBuffered,
+            False,
+        )
+        self.window.setTitle_("Screen Rotator Settings")
+        self.window.center()
+        self.window.setReleasedWhenClosed_(False)
+
+        content = AppKit.NSView.alloc().initWithFrame_(
+            Foundation.NSMakeRect(0, 0, width, height)
+        )
+        self.window.setContentView_(content)
+
+        title = self._make_label(
+            "Shortcut Settings", 16, (20, height - 42, width - 40, 24), bold=True,
+        )
+        content.addSubview_(title)
+
+        actions = [
+            ("toggle", "Toggle Orientation"),
+            ("rotate_0", "Standard (0\u00b0)"),
+            ("rotate_90", "Vertical (90\u00b0)"),
+            ("rotate_270", "Vertical (270\u00b0)"),
+        ]
+        y = height - 82
+        for action_id, display_name in actions:
+            lbl = self._make_label(display_name, 13, (30, y, 160, 22))
+            content.addSubview_(lbl)
+
+            shortcut_str = self.app.get_shortcut_display(action_id)
+            val = self._make_label(
+                shortcut_str, 13, (195, y, 130, 22),
+                color=AppKit.NSColor.secondaryLabelColor(),
+            )
+            self.labels[action_id] = val
+            content.addSubview_(val)
+
+            btn = AppKit.NSButton.alloc().initWithFrame_(
+                Foundation.NSMakeRect(335, y - 2, 55, 24),
+            )
+            btn.setTitle_("Set")
+            btn.setBezelStyle_(AppKit.NSRoundedBezelStyle)
+            btn.setTarget_(self)
+            btn.setAction_(objc.selector(self.recordClicked_, signature=b"v@:@"))
+            btn.setIdentifier_(action_id)
+            self.set_buttons[action_id] = btn
+            content.addSubview_(btn)
+
+            clr = AppKit.NSButton.alloc().initWithFrame_(
+                Foundation.NSMakeRect(395, y - 2, 40, 24),
+            )
+            clr.setTitle_("\u2715")
+            clr.setBezelStyle_(AppKit.NSRoundedBezelStyle)
+            clr.setTarget_(self)
+            clr.setAction_(objc.selector(self.clearClicked_, signature=b"v@:@"))
+            clr.setIdentifier_(action_id)
+            content.addSubview_(clr)
+
+            y -= 42
+
+        sep = AppKit.NSBox.alloc().initWithFrame_(
+            Foundation.NSMakeRect(20, y + 10, width - 40, 1),
+        )
+        sep.setBoxType_(AppKit.NSBoxSeparator)
+        content.addSubview_(sep)
+
+        clear_all = AppKit.NSButton.alloc().initWithFrame_(
+            Foundation.NSMakeRect(width - 130, y - 22, 110, 24),
+        )
+        clear_all.setTitle_("Clear All")
+        clear_all.setBezelStyle_(AppKit.NSRoundedBezelStyle)
+        clear_all.setTarget_(self)
+        clear_all.setAction_(objc.selector(self.clearAllClicked_, signature=b"v@:@"))
+        content.addSubview_(clear_all)
+
+        footer = self._make_label(
+            "Shortcuts are saved automatically.", 11,
+            (20, 12, width - 40, 18),
+            color=AppKit.NSColor.tertiaryLabelColor(),
+        )
+        content.addSubview_(footer)
+
+        self.window.makeKeyAndOrderFront_(None)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+
+    @objc.python_method
+    def _make_label(self, text, size, rect, bold=False, color=None):
+        label = AppKit.NSTextField.alloc().initWithFrame_(
+            Foundation.NSMakeRect(*rect),
+        )
+        label.setStringValue_(text)
+        font = (AppKit.NSFont.boldSystemFontOfSize_(size) if bold
+                else AppKit.NSFont.systemFontOfSize_(size))
+        label.setFont_(font)
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        if color:
+            label.setTextColor_(color)
+        return label
+
+    @objc.python_method
+    def refresh_labels(self):
+        """Update all shortcut labels to current values. Main thread only."""
+        if not self.window or not self.window.isVisible():
+            return
+        for action_id, label in self.labels.items():
+            shortcut_str = self.app.get_shortcut_display(action_id)
+            label.setStringValue_(shortcut_str)
+            label.setTextColor_(AppKit.NSColor.secondaryLabelColor())
+        for btn in self.set_buttons.values():
+            btn.setEnabled_(True)
+
+    @objc.python_method
+    def set_recording_state(self, action_id):
+        """Show 'Recording...' for a specific action. Main thread only."""
+        if not self.window or not self.window.isVisible():
+            return
+        if action_id in self.labels:
+            self.labels[action_id].setStringValue_("Recording...")
+            self.labels[action_id].setTextColor_(AppKit.NSColor.systemRedColor())
+        for btn in self.set_buttons.values():
+            btn.setEnabled_(False)
+
+    def recordClicked_(self, sender):
+        action_id = sender.identifier()
+        self.app.start_recording(action_id)
+
+    def clearClicked_(self, sender):
+        action_id = sender.identifier()
+        self.app.shortcuts[action_id] = None
+        self.app.save_config()
+        self.app.start_hotkey_listener()
+        self.app.queue_update_menu()
+
+    def clearAllClicked_(self, sender):
+        self.app.clear_all_shortcuts(None)
+
+
 def action_to_rotation(action: str) -> Optional[int]:
     return ACTION_ROTATIONS.get(action)
 
@@ -199,6 +370,11 @@ class ScreenRotatorApp(rumps.App):
                     elif task[0] == "update_menu":
                         self._menu_update_pending = False
                         self.update_menu()
+                    elif task[0] == "settings_recording":
+                        if self.settings_window:
+                            self.settings_window.set_recording_state(task[1])
+                    elif task[0] == "restart_hotkeys":
+                        self.start_hotkey_listener()
                 except Exception as e:
                     logging.error(f"Error processing UI task {task[0]}: {e}")
         except queue.Empty:
@@ -257,6 +433,7 @@ class ScreenRotatorApp(rumps.App):
         if not self.target_display_persistent_id:
             self.auto_select_target()
 
+        self.settings_window = SettingsWindow.alloc().initWithApp_(self)
         self.setup_display_observer()
         self.update_menu()
         self.start_hotkey_listener()
@@ -414,22 +591,18 @@ class ScreenRotatorApp(rumps.App):
         self.menu.add(rumps.MenuItem("Refresh Displays", callback=self.refresh_displays))
         self.menu.add(rumps.separator)
 
-        # Menu-based settings avoids AppKit NSWindow threading crashes (see commit 0c970d8)
-        settings_menu = rumps.MenuItem("Settings...")
-        for action_id, _, short_label in ACTION_LABELS:
-            settings_menu.add(rumps.MenuItem(
-                f"Record {short_label}...",
-                callback=lambda _, aid=action_id: self.start_recording(aid),
-            ))
-        settings_menu.add(rumps.separator)
-        settings_menu.add(rumps.MenuItem("Clear All Shortcuts", callback=self.clear_all_shortcuts))
-        self.menu.add(settings_menu)
+        self.menu.add(rumps.MenuItem(
+            "Settings...",
+            callback=lambda _: self.settings_window.show(),
+        ))
         
         self.menu.add(rumps.separator)
         launch_item = rumps.MenuItem("Launch at Login", callback=self.toggle_launch_at_login)
         launch_item.state = self.is_launch_at_login_enabled()
         self.menu.add(launch_item)
-        
+
+        if hasattr(self, "settings_window") and self.settings_window:
+            self.settings_window.refresh_labels()
 
     def refresh_displays(self, _) -> None:
         available_ids = {display["persistent_id"] for display in self.list_displays()}
@@ -778,9 +951,20 @@ class ScreenRotatorApp(rumps.App):
                     pass
                 self.recording_listener = None
 
+            # Stop the hotkey listener BEFORE creating the recording listener.
+            # Two simultaneous pynput CGEventTaps crash on macOS.
+            if self.hotkey_listener:
+                try:
+                    self.hotkey_listener.stop()
+                except Exception:
+                    pass
+                self.hotkey_listener = None
+                logging.info("Hotkey listener stopped for recording.")
+
             # Use self.notify() (queue-based) — recording runs on a background thread
             # and rumps.notification() is not thread-safe
             self.notify("Record Shortcut", f"Press keys for {action.replace('_', ' ')}", "Press Esc to cancel")
+            self.ui_queue.put(("settings_recording", action))
 
             def on_press(key):
                 try:
@@ -853,8 +1037,11 @@ class ScreenRotatorApp(rumps.App):
             self.recording_action = None
             self.save_config()
             self.queue_update_menu()
-            self.start_hotkey_listener()
-            
+            # MUST NOT call start_hotkey_listener() here — we're inside a pynput
+            # callback thread, and creating a new CGEventTap from within an active
+            # tap's callback crashes the process.  Defer to the main thread.
+            self.ui_queue.put(("restart_hotkeys",))
+
             self.notify("Shortcut Saved", action.replace("_", " ").title(), display)
             logging.info(f"Shortcut saved for {action}: {display}")
         except Exception as e:
