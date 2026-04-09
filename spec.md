@@ -25,7 +25,11 @@ The ultimate macOS utility for instant display orientation control. Allows users
 - Ensure window arrangement and specific display origins are preserved during orientation shifts.
 - Rely on external utility output for parameter storage if needed.
 
+### 2.5 Built-in Display Safety (15s Revert)
+- The app must detect if the rotation target is the built-in MacBook display.
+- To prevent permanent trackpad/mouse disorientation due to Apple's native hardware limitations, any rotation of the built-in screen MUST trigger an automatic 15-second revert countdown accompanied by a native macOS popup dialog.
+- The user must explicitly click "Keep Rotation" to cancel the timer, otherwise the screen auto-reverts to its previous safe degree.
+
 ## 3. Out of Scope
 - Windows/Linux compatibility.
-- Internal Macbook display rotation (frequently restricted by Apple Hardware, focus is heavily weighted toward external monitors).
 - Cloud syncing of settings.
